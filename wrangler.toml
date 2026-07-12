@@ -1,0 +1,21 @@
+# Cloudflare Worker + D1 (SQLite). Replace database_id after: npm run db:create
+name = "journal-alpha-api"
+main = "src/worker.js"
+compatibility_date = "2024-12-30"
+
+# Optional: pin deploys to a specific Cloudflare account (from `npx wrangler whoami`).
+# account_id = "f55ed78bba9b6ca827491f5fa055a19b"
+
+# Browser origins allowed to call this API (comma-separated).
+[vars]
+ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://journalalpha.com,https://www.journalalpha.com"
+
+[[routes]]
+pattern = "api.journalalpha.com/*"
+zone_name = "journalalpha.com"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "journal-alpha-db"
+database_id = "f499a649-c1e5-4446-852a-f36830aed0b7"
+migrations_dir = "migrations"
