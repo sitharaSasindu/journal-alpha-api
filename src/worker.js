@@ -2,28 +2,37 @@
  * Journal Alpha API.
  *
  * One rule governs this whole Worker: **it never sees, stores, or relays a
- * user's journal.** It exists only to fetch public reference data that a
- * browser is not allowed to fetch for itself, and to hand it back with a CORS
- * header. There are no cookies and no auth.
+ * user's journal.** Trades, accounts, notes and reviews go browser-to-Drive
+ * directly and never pass through here. That is the product, and it is not
+ * negotiable. There are no cookies and no session auth.
  *
- * What it does keep, in KV, is copies of that public file: the current week,
- * and an archive of the weeks before it. That is not user data - it is the
- * same file anyone can download from Forex Factory - and none of it is
- * attributable to a person.
+ * Two things are stored, and both are exceptions worth naming:
  *
- * That rule is why the previous version of this file is gone. It had one
- * endpoint, `POST /api/v1/profiles`, which upserted each signing-in user's
- * email, name, picture and a login counter into a D1 table. That is a
- * server-side user profile, and the product's central claim is that no such
- * thing exists. The app never called it; it is deleted rather than left
- * dormant, because a dormant endpoint with a database behind it is still a
- * place where user data can end up.
+ * 1. In KV, copies of the public Forex Factory calendar - the current week
+ *    plus a three-month archive. Not user data; the same file anyone can
+ *    download, and nothing in it is attributable to a person.
  *
- * What remains:
+ * 2. In D1, one row per Google account that has connected Drive: email,
+ *    display name, first seen day, last seen day. **That is personal data,
+ *    and it is a deliberate reversal of an earlier decision to store none.**
  *
- *   GET /health                 liveness, the routes on offer, archive depth
- *   GET /calendar?week=this     the public economic calendar for this week
- *   GET /calendar?range=archive every week still held, merged and sorted
+ * The history of (2) matters, because this file used to argue the opposite. It
+ * once had `POST /api/v1/profiles`, writing email, name, picture and a login
+ * counter to D1; that was deleted as contradicting the privacy claim, and the
+ * claim was reworded to say no such thing existed. It has now been asked for
+ * again, knowingly, to answer how many people use the app and when. The
+ * endpoint is narrower than the one that was removed - no picture, dates
+ * rather than timestamps, a counter that moves once a day - and the privacy
+ * page states what is kept instead of denying that anything is. The part of
+ * the promise that mattered, that nobody's trading history is on our servers,
+ * is untouched.
+ *
+ * What is here:
+ *
+ *   GET  /health                 liveness, the routes on offer, archive depth
+ *   GET  /calendar?week=this     the public economic calendar for this week
+ *   GET  /calendar?range=archive every week still held, merged and sorted
+ *   POST /session                records that an account signed in
  *
  * Why /calendar has to exist at all: Forex Factory's weekly feeds are free and
  * public, but their servers send no `Access-Control-Allow-Origin` header, so a
@@ -97,7 +106,8 @@ function allowOrigin(request, env) {
 
 const corsHeaders = (origin) => ({
   "access-control-allow-origin": origin,
-  "access-control-allow-methods": "GET, OPTIONS",
+  "access-control-allow-methods": "GET, POST, OPTIONS",
+  "access-control-allow-headers": "content-type",
   "access-control-max-age": "86400",
   vary: "origin",
 });
@@ -125,12 +135,17 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
-    if (request.method !== "GET") {
-      return json({ error: "Only GET is supported." }, 405, origin);
-    }
 
     const url = new URL(request.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
+
+    if (request.method === "POST") {
+      if (path === "/session") return recordSession(request, env, origin);
+      return json({ error: `No POST route for ${path}.` }, 404, origin);
+    }
+    if (request.method !== "GET") {
+      return json({ error: "Only GET and POST are supported." }, 405, origin);
+    }
 
     if (path === "/health" || path === "/") {
       return health(env, origin);
@@ -175,14 +190,185 @@ async function health(env, origin) {
   return json(
     {
       ok: true,
-      stores: "public calendar data only, never user data",
-      retention: `${ARCHIVE_WEEKS} weeks`,
+      stores: "the public calendar, and one sign-in record per account. Never a journal.",
+      retention: `${ARCHIVE_WEEKS} weeks of calendar`,
       archivedWeeks: weeks,
-      routes: ["/health", "/calendar?week=this", "/calendar?range=archive"],
+      routes: [
+        "/health",
+        "/calendar?week=this",
+        "/calendar?range=archive",
+        "POST /session",
+      ],
     },
     200,
     origin,
   );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sign-in records                                                           */
+/* ------------------------------------------------------------------------- */
+
+/** Google's endpoint for validating an ID token: checks the signature for us. */
+const TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo?id_token=";
+
+/** The only issuers a Google ID token may claim. */
+const GOOGLE_ISSUERS = new Set(["accounts.google.com", "https://accounts.google.com"]);
+
+/**
+ * Verifies a Google ID token and returns the identity inside it.
+ *
+ * The client sends a signed JWT and nothing else, so every field written to
+ * the database comes from Google rather than from the caller. That is the
+ * whole point: an earlier version of this endpoint accepted an email and a
+ * name in the request body, which meant anyone who read the bundle could post
+ * a fabricated row and the numbers could not be trusted.
+ *
+ * Signature checking is delegated to Google's `tokeninfo` endpoint rather than
+ * done here against their JWKS. Both are correct; this one is a network call
+ * instead of sixty lines of WebCrypto, and at one request per user per day the
+ * call costs nothing while the hand-rolled version would be a place for a
+ * subtle verification bug to live. If the volume ever makes that trade wrong,
+ * switch to caching `https://www.googleapis.com/oauth2/v3/certs` and verifying
+ * RS256 locally - the claim checks below do not change.
+ *
+ * Delegating the signature does not mean trusting the response blindly. A
+ * validly signed token proves only that *Google* issued it - to *somebody*.
+ * Without the `aud` check any site with a Google login could forward its own
+ * users' tokens here and write rows into this table, so that check is what
+ * makes this our sign-in record rather than anyone's.
+ */
+async function verifyIdToken(credential, expectedAud) {
+  let res;
+  try {
+    res = await fetch(TOKENINFO_URL + encodeURIComponent(credential));
+  } catch (err) {
+    return { error: `Could not reach Google to verify the token: ${err}` };
+  }
+  if (!res.ok) return { error: "Google rejected the token." };
+
+  let claims;
+  try {
+    claims = await res.json();
+  } catch {
+    return { error: "Google's verification response was not JSON." };
+  }
+
+  // Issued for this app, by Google, to a verified address, and still valid.
+  if (!expectedAud) return { error: "No expected audience is configured." };
+  if (claims.aud !== expectedAud) return { error: "Token was issued for another app." };
+  if (!GOOGLE_ISSUERS.has(claims.iss)) return { error: "Token was not issued by Google." };
+  if (!claims.sub) return { error: "Token carries no subject." };
+
+  // `exp` is seconds since the epoch, and arrives as a string from tokeninfo.
+  const exp = Number(claims.exp);
+  if (!Number.isFinite(exp) || exp * 1000 <= Date.now()) {
+    return { error: "Token has expired." };
+  }
+
+  /*
+   * An unverified address is not identity.
+   *
+   * `email_verified` false means Google has not confirmed the address belongs
+   * to whoever is holding the account, so storing it would put an address in
+   * this table that its owner may never have used here. The row is still
+   * written - `sub` is trustworthy on its own and is what the count is built
+   * on - but the address is left out rather than recorded as fact.
+   */
+  const verified = claims.email_verified === true || claims.email_verified === "true";
+
+  return {
+    // Google's stable, per-app subject id. Survives an email change.
+    id: String(claims.sub).slice(0, 200),
+    email: verified ? String(claims.email || "").toLowerCase().slice(0, 320) : "",
+    name: String(claims.name || "").slice(0, 200),
+  };
+}
+
+/**
+ * Records that an account signed in, so usage can be counted.
+ *
+ * This is the one endpoint that stores personal data, and it is a deliberate
+ * reversal of the rule the rest of this file follows. It exists to answer
+ * three questions from the Cloudflare dashboard: how many people use the app,
+ * when each first appeared, and when each was last seen. It writes one row per
+ * account and nothing else - no IP, no user agent, no behaviour.
+ *
+ * It takes a Google ID token and derives the identity from it, so the figures
+ * are worth something. What it deliberately does **not** accept is the Drive
+ * access token: that grants `drive.appdata`, so forwarding it here would hand
+ * this Worker the ability to read the caller's entire journal - trading the
+ * product's actual promise for a usage metric. An ID token grants no API
+ * access at all, which is exactly why it is the right thing to send.
+ */
+async function recordSession(request, env, origin) {
+  if (!env.DB) return json({ error: "No database is configured." }, 503, origin);
+
+  /*
+   * Only the app's own origins may write.
+   *
+   * Secondary now that identity is verified - a forged row is no longer
+   * possible - but it still stops another *site* quietly pointing its users at
+   * this endpoint and filling the table with their sign-ins.
+   */
+  const sent = request.headers.get("origin") || "";
+  const allowed = (env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+  if (allowed.length && sent && !allowed.includes(sent)) {
+    return json({ error: "Origin not allowed." }, 403, origin);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Expected a JSON body." }, 400, origin);
+  }
+
+  const credential = typeof body.credential === "string" ? body.credential.trim() : "";
+  if (!credential) return json({ error: "A Google ID token is required." }, 400, origin);
+  // A JWT is three dot-separated segments; anything else is not worth a
+  // round trip to Google.
+  if (credential.split(".").length !== 3 || credential.length > 4096) {
+    return json({ error: "That is not an ID token." }, 400, origin);
+  }
+
+  const identity = await verifyIdToken(credential, (env.GOOGLE_CLIENT_ID || "").trim());
+  if (identity.error) return json({ error: identity.error }, 401, origin);
+
+  const { id, email, name } = identity;
+  const today = new Date().toISOString().slice(0, 10);
+
+  try {
+    /*
+     * One statement, so a first sign-in and a returning one are the same code
+     * path and cannot race each other into two rows.
+     *
+     * `first_seen` is absent from the UPDATE on purpose - it is written once
+     * and never touched again, which is what makes it mean "first registered
+     * day". `active_days` only moves when the day changes, so the count stays
+     * meaningful however many times the page is reloaded.
+     */
+    await env.DB.prepare(
+      `INSERT INTO users (id, email, name, first_seen, last_seen, active_days)
+       VALUES (?1, ?2, ?3, ?4, ?4, 1)
+       ON CONFLICT(id) DO UPDATE SET
+         email = ?2,
+         name = ?3,
+         active_days = active_days + (CASE WHEN users.last_seen < ?4 THEN 1 ELSE 0 END),
+         last_seen = ?4`,
+    )
+      .bind(id, email, name, today)
+      .run();
+  } catch (err) {
+    // Never fail loudly: the client treats this as fire-and-forget, and a
+    // broken metric must not be able to affect anybody's sign-in.
+    return json({ error: `Could not record the session: ${err}` }, 500, origin);
+  }
+
+  return json({ ok: true }, 200, origin);
 }
 
 /**
@@ -313,11 +499,33 @@ async function archive(env, origin, ctx) {
   );
 
   /*
-   * A cold archive still has to answer with something. The first visitor after
-   * a deploy would otherwise get an empty calendar purely because nothing has
-   * been filed yet, so fetch the current week and file it on the way out.
+   * A cold archive still has to answer with something.
+   *
+   * The weekly cache is tried before the upstream, and that ordering is the
+   * whole point: measured against the live relay minutes after a deploy, going
+   * straight upstream here returned "Upstream rate limited this relay" - the
+   * weekly route had just fetched, so the throttle was already tripped, and an
+   * archive request failed while a perfectly good copy of the week sat in KV
+   * one read away. Only a relay that has never fetched anything at all now
+   * reaches the network on this path.
    */
   if (!events.length) {
+    const cached = (await kv.get("fresh:this", "json")) || (await kv.get("last:this", "json"));
+    if (cached?.events?.length) {
+      ctx.waitUntil(fileWeeks(kv, cached.events));
+      return json(
+        {
+          range: "archive",
+          weeks: [],
+          fetchedAt: cached.fetchedAt ?? new Date().toISOString(),
+          events: cached.events,
+        },
+        200,
+        origin,
+        { "x-cache": "cold-from-week" },
+      );
+    }
+
     const result = await fetchEventsWithReason(UPSTREAM.this);
     if (!Array.isArray(result.events)) return json({ error: result.why }, 502, origin);
     ctx.waitUntil(fileWeeks(kv, result.events));

@@ -27,6 +27,16 @@ compatibility_date = "2025-09-01"
 [vars]
 ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://journal-alpha.pages.dev,https://journalalpha.com,https://www.journalalpha.com"
 
+# The OAuth client id the app signs in with, used to check the `aud` claim on
+# every ID token before a row is written.
+#
+# This check is what makes the sign-in table ours. A validly signed Google
+# token proves only that Google issued it to somebody; without this, any site
+# with a Google login could forward its own users' tokens here. Not a secret -
+# it is in the app's bundle already - but it must match
+# VITE_GOOGLE_CLIENT_ID in journal-alpha/.env or every write is rejected.
+GOOGLE_CLIENT_ID = "36916452493-nspl76m1co2ftjphp92alcq93fsntlmv.apps.googleusercontent.com"
+
 # Enable once journalalpha.com is a zone in this Cloudflare account. Until
 # then the Worker is reachable on its workers.dev subdomain, which is what the
 # app is pointed at.
@@ -39,6 +49,19 @@ ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://journal-a
 [[kv_namespaces]]
 binding = "CALENDAR_CACHE"
 id = "a0be196a95fd45448c99cccbe6a9a40c"
+
+# Sign-in records: one row per Google account that has connected Drive, with
+# its email, display name, first and last seen day. See migrations/0001_users.sql
+# and the README - this is a deliberate reversal of the earlier "no user data
+# server-side" rule, and the privacy page states it.
+#
+# A previous binding to `journal-alpha-db` was deleted along with the endpoint
+# that wrote to it. This is a new, separate database rather than that one
+# revived, so nothing from the old schema can linger in it.
+[[d1_databases]]
+binding = "DB"
+database_name = "journal-alpha-users"
+database_id = "28a43ecd-37d2-4f81-bd2a-1667da10dd3b"
 
 # Files the current week into the archive once a day.
 #

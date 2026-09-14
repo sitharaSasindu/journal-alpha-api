@@ -1,28 +1,40 @@
 # Journal Alpha API
 
-A single Cloudflare Worker that relays public reference data a browser is not
-allowed to fetch for itself. **It never sees, stores or relays a user's
-journal.** No database, no cookies, no auth.
+A single Cloudflare Worker behind Journal Alpha. **It never sees, stores or
+relays a user's journal** - no trades, notes, screenshots or balances. Those go
+browser-to-Drive directly. No cookies, no session auth.
 
-It does have one KV namespace, holding copies of the public Forex Factory
-calendar feed. See [What it stores](#what-it-stores) - that is a deliberate
-reversal of an earlier "no storage bindings at all" rule, for a measured
-reason, and it changes nothing about the boundary below.
+It stores two things, and both are exceptions worth naming up front:
+
+- **KV**: copies of the public Forex Factory calendar feed, current week plus a
+  three-month archive. Not user data. See [What it stores](#what-it-stores).
+- **D1**: one row per Google account that has connected Drive - email, display
+  name, first and last seen day. **That is personal data**, and a deliberate
+  reversal of an earlier decision to keep none. See
+  [Sign-in records](#sign-in-records).
 
 ## What changed, and why
 
-This Worker previously existed to serve `POST /api/v1/profiles`, which upserted
-each signing-in user's **email, name, picture and a login counter** into a D1
-table. That is a server-side user profile, and the product's central claim is
-that no such thing exists. The app never called it.
+Worth reading before adding anything here, because this Worker has already
+argued both sides of the same question.
 
-Both the endpoint and the `[[d1_databases]]` binding are gone, and the
-migration that created the table has been deleted. A dormant endpoint with a
-database behind it is still a place user data can end up, so it was removed
-rather than left switched off.
+It originally served `POST /api/v1/profiles`, which upserted each signing-in
+user's **email, name, picture and a login counter** into a D1 table called
+`journal-alpha-db`. That endpoint, its binding and its migration were all
+deleted: a server-side user profile contradicted the product's central claim,
+the app never called it anyway, and a dormant endpoint with a database behind
+it is still a place user data can end up.
 
-**If that database was ever deployed, delete it too** - removing the binding
-does not remove the data:
+It was then asked for again - knowingly, with the privacy trade-off on the
+table - because there was no way to answer *how many people use this*. So
+`POST /session` exists now, writing to a **new and separate** database,
+`journal-alpha-users`, rather than reviving the old one. It is narrower than
+what was removed: no picture, dates instead of timestamps, and a counter that
+moves once a day. The difference that matters is not the schema, though - it is
+that the privacy page now *states* what is kept instead of denying anything is.
+
+**If the old `journal-alpha-db` still exists, delete it** - dropping a binding
+never drops the data, and it may still hold profiles from the original version:
 
 ```bash
 npx wrangler d1 list
@@ -36,6 +48,7 @@ npx wrangler d1 delete journal-alpha-db
 | `GET /health` | Liveness, the routes on offer, and which weeks are archived |
 | `GET /calendar?week=this` | The current week, refetched upstream every 30 minutes |
 | `GET /calendar?range=archive` | Every week still held, merged and sorted. No upstream call |
+| `POST /session` | Records that an account signed in. The one route that stores personal data |
 
 `/api/v1/calendar` is accepted as an alias, for anyone already pointing at a
 versioned path.
@@ -78,6 +91,110 @@ no past weeks to backfill from.
 
 None of this is user data. It is the same public file anyone can download, and
 nothing in it is attributable to a person.
+
+## Sign-in records
+
+`POST /session` takes **one field, a Google ID token**, and writes one row per
+account:
+
+```json
+{ "credential": "<Google ID token JWT>" }
+```
+
+| Column | Holds | Source |
+| --- | --- | --- |
+| `id` | Google's stable `sub` for the account | verified token |
+| `email` | Lower-cased address; empty if `email_verified` is false | verified token |
+| `name` | Google display name | verified token |
+| `first_seen` | The day it first connected. Written once, never updated | server clock |
+| `last_seen` | The most recent day it was seen | server clock |
+| `active_days` | Distinct days seen - not raw sign-ins | counter |
+
+**Every stored value comes from Google, not from the caller.** The relay posts
+the token to `https://oauth2.googleapis.com/tokeninfo`, which checks the
+signature, and then requires:
+
+- `aud` equal to `GOOGLE_CLIENT_ID` - **the check that makes this table ours.**
+  A valid signature only proves Google issued the token to *somebody*; without
+  this, any site with a Google login could forward its users' tokens here.
+- `iss` of `accounts.google.com`
+- `exp` in the future, and a present `sub`
+
+Signature checking is delegated rather than done against Google's JWKS here.
+Both are correct; at one request per user per day the network call costs
+nothing, while hand-rolled RS256 is somewhere for a subtle verification bug to
+live. To switch later, cache `https://www.googleapis.com/oauth2/v3/certs` and
+verify locally - the claim checks above do not change.
+
+The Drive **access** token is never accepted and there is no endpoint that
+would take it. It carries `drive.appdata`, so a server holding it could read
+the caller's journal; an ID token grants no API access at all, which is exactly
+why it is the thing to send.
+
+Dates, not timestamps, and no IP address, user agent, referrer or page view.
+The client reports at most once a day, and the Worker only increments
+`active_days` when the day actually changes, so reloading the page twenty times
+counts once.
+
+**This is personal data, and it reverses the decision documented above.** The
+endpoint that was deleted stored email, name, *picture* and a raw login counter;
+this one is narrower, its figures are verified rather than asserted, and its
+existence is stated on the app's privacy page rather than denied. What has not
+changed is the part that matters: no trade, note, screenshot or balance ever
+reaches this Worker.
+
+### Reading the numbers
+
+Cloudflare dashboard → **Workers & Pages → D1 → journal-alpha-users →
+Console**. Every query below was run against a seeded copy of this schema.
+
+```sql
+-- How many people have ever signed in.
+SELECT COUNT(*) AS total_users FROM users;
+
+-- Signups per day, newest first.
+SELECT first_seen AS day, COUNT(*) AS new_users
+FROM users GROUP BY day ORDER BY day DESC LIMIT 30;
+
+-- Signups per month.
+SELECT substr(first_seen, 1, 7) AS month, COUNT(*) AS signups
+FROM users GROUP BY month ORDER BY month;
+
+-- Active recently.
+SELECT COUNT(*) AS active_7d  FROM users WHERE last_seen >= date('now', '-7 day');
+SELECT COUNT(*) AS active_30d FROM users WHERE last_seen >= date('now', '-30 day');
+
+-- Everyone, most recently seen first.
+SELECT email, name, first_seen, last_seen, active_days
+FROM users ORDER BY last_seen DESC;
+
+-- Signed up but stopped coming back.
+SELECT email, first_seen, last_seen, active_days
+FROM users WHERE last_seen < date('now', '-30 day') ORDER BY last_seen;
+
+-- One account.
+SELECT * FROM users WHERE email = 'someone@example.com';
+```
+
+### Deleting someone's record
+
+Somebody asking to be forgotten is asking about this table - erasing their
+device and their Drive folder does not touch it. The app's Settings page tells
+them to email you, so this is the query behind that promise:
+
+```sql
+DELETE FROM users WHERE email = 'someone@example.com';
+```
+
+They will reappear as a new signup the next time they connect, with today's
+date as `first_seen`.
+
+### Turning it off
+
+Clear `VITE_USAGE_ENDPOINT` in `journal-alpha/.env` and redeploy the frontend.
+The app then makes no request that identifies anybody. The endpoint here keeps
+working but nothing calls it; drop the `[[d1_databases]]` binding and delete the
+database to remove the data as well.
 
 ## Why /calendar needs to exist
 
@@ -150,14 +267,22 @@ configuration.
 
 ## The one boundary
 
-This Worker must never gain an endpoint that accepts journal data, and its
-storage must never hold anything but public reference data. Sync goes
-browser-to-Drive directly and must stay that way - that is the entire product.
+**This Worker must never gain an endpoint that accepts journal data.** Trades,
+notes, screenshots, balances, reviews: none of it may pass through here, ever.
+Sync goes browser-to-Drive directly and must stay that way, because that is the
+entire product and the only claim that cannot be walked back.
 
-The KV namespace is the single, argued exception: it holds a public file that
-anyone can download, keyed by week, with no request metadata and nothing
-per-user. If something here ever needs to remember something *about a user*,
-that is a sign the design has gone wrong.
+Two things are stored, and the difference between them and the line above is
+the difference between knowing *that* somebody uses the app and knowing *what
+they trade*:
+
+- The calendar in KV is a public file anyone can download, keyed by week, with
+  no request metadata and nothing per-user.
+- The sign-in table in D1 identifies people by email. It was added knowingly,
+  after the opposite decision had been made and documented here, because
+  counting users turned out to be worth it. It holds identity and dates and
+  nothing else - and any proposal to add "just one more column" about what a
+  user *did* is the thing this section exists to refuse.
 
 ## Terms
 
