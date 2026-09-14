@@ -1,21 +1,50 @@
-# Cloudflare Worker + D1 (SQLite). Replace database_id after: npm run db:create
+# Journal Alpha API.
+#
+# A relay for public reference data. It holds exactly one thing: a cached copy
+# of the public economic calendar, in KV.
+#
+# That is a deliberate reversal of an earlier "no storage bindings at all"
+# rule, and the reason is measured rather than theoretical. The relay first
+# used the Cache API, which in Workers is *per-colocation* - requests land in
+# different colos, each with a cold cache, so most calls went to the upstream
+# and were throttled. Eight consecutive calls succeeded twice. KV is
+# account-global, so one fetch every 30 minutes serves everybody.
+#
+# The boundary that actually matters is unchanged and absolute: this Worker
+# never stores, receives or relays a user's journal. The previous version had
+# a D1 database holding user profiles - email, name, picture, login counts -
+# and both that endpoint and its binding were deleted. KV here holds a public
+# file that anyone can download; nothing about a user goes into it.
 name = "journal-alpha-api"
 main = "src/worker.js"
-compatibility_date = "2024-12-30"
+compatibility_date = "2025-09-01"
 
-# Optional: pin deploys to a specific Cloudflare account (from `npx wrangler whoami`).
+# Optional: pin deploys to a specific Cloudflare account (`npx wrangler whoami`).
 # account_id = "f55ed78bba9b6ca827491f5fa055a19b"
 
-# Browser origins allowed to call this API (comma-separated).
+# Browser origins allowed to call this API. An allowlist rather than `*`, so
+# the relay cannot be quietly adopted as a free open proxy by other sites.
 [vars]
-ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://journalalpha.com,https://www.journalalpha.com"
+ALLOWED_ORIGINS = "http://localhost:3000,http://127.0.0.1:3000,https://journal-alpha.pages.dev,https://journalalpha.com,https://www.journalalpha.com"
 
-[[routes]]
-pattern = "api.journalalpha.com/*"
-zone_name = "journalalpha.com"
+# Enable once journalalpha.com is a zone in this Cloudflare account. Until
+# then the Worker is reachable on its workers.dev subdomain, which is what the
+# app is pointed at.
+# [[routes]]
+# pattern = "api.journalalpha.com/*"
+# zone_name = "journalalpha.com"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "journal-alpha-db"
-database_id = "f499a649-c1e5-4446-852a-f36830aed0b7"
-migrations_dir = "migrations"
+# Cached copy of the public calendar feed, plus a rolling three-month archive
+# of the weeks already seen. Public reference data only.
+[[kv_namespaces]]
+binding = "CALENDAR_CACHE"
+id = "a0be196a95fd45448c99cccbe6a9a40c"
+
+# Files the current week into the archive once a day.
+#
+# The archive cannot be backfilled: the upstream publishes the current week and
+# nothing else, so a week that passes with nobody opening the page leaves a
+# permanent hole. This closes that. 06:17 UTC is a quiet hour for the feed, and
+# the odd minute avoids the top-of-hour crowd that the upstream throttles.
+[triggers]
+crons = ["17 6 * * *"]
